@@ -23,45 +23,55 @@ struct NiflotMetadata {
 uint256 constant MAX_DURATION_SECONDS = 60 * 60 * 24 * 30;
 
 contract Niflot is ERC721, Ownable {
+
     using CFAv1Library for CFAv1Library.InitData;
     using IncDec for CFAv1Library.InitData;
-
-    ISuperfluid private _host;
-
-    IConstantFlowAgreementV1 private _cfa;
     CFAv1Library.InitData public cfaV1;
 
+    /// @dev when a NIFLOT is transferred for the first time and engaged
     event NiflotStarted(
+        // token id of the NIFLOT
         uint256 tokenId,
-        address origin,
+        // original sender of tokenized stream
+        address indexed origin,
+        // the original receiver of the tokenized stream
         address indexed receiver,
-        uint256 indexed matureAt
+        // the timestamp where the NIFLOT will become burnable
+        uint256 matureAt
     );
 
+    /// @dev when a NIFLOT is burned
     event NiflotTerminated(
+        // token id of the NIFLOT
         uint256 tokenId,
+        // original sender of tokenized stream
         address indexed origin,
+        // the original receiver of the tokenized stream
         address indexed receiver
     );
 
+    // /// @dev Super Token => acceptance for NIFLOT creation
+    // mapping(ISuperToken => bool) private _acceptedTokens;
+
+    /// @notice token ids => metadata
     mapping(uint256 => NiflotMetadata) public niflots;
 
-    //todo: unused, do we need it anyway?!
-    mapping(ISuperToken => bool) private _acceptedTokens;
-
-    /**
-     * @dev origin => investor => total acquired flowrate
-     */
+    /// @notice origin => investor => total acquired flowrate
     mapping(address => mapping(address => int96)) private _investments;
 
+    /// @notice current token id
     uint256 public nextId;
 
-    constructor(ISuperfluid host) Ownable() ERC721("Niflot", "NFLOT") {
-        _host = host;
-        nextId = 1;
+    constructor(
+        ISuperfluid host
+    ) payable Ownable() 
+      ERC721(
+        "Niflot", 
+        "NIFLOT"
+      ) 
+    {
 
-        assert(address(_host) != address(0));
-        _cfa = IConstantFlowAgreementV1(
+        IConstantFlowAgreementV1 cfa = IConstantFlowAgreementV1(
             address(
                 host.getAgreementClass(
                     keccak256(
@@ -70,24 +80,33 @@ contract Niflot is ERC721, Ownable {
                 )
             )
         );
-        cfaV1 = CFAv1Library.InitData(host, _cfa);
+
+        cfaV1 = CFAv1Library.InitData(host, cfa);
+
     }
 
+    /// @dev require that tokenId exists (minted and not burnt)
+    /// @param tokenId Token ID whose existance is being checked
     modifier exists(uint256 tokenId) {
         require(_exists(tokenId), "token doesn't exist or has been burnt");
         _;
     }
 
-    function toggleAcceptToken(ISuperToken token, bool accept)
-        public
-        onlyOwner
-    {
-        _acceptedTokens[token] = accept;
-    }
+    // /// @dev set a Super Token to accepted or not
+    // /// @param token Super Token whose acceptance status is being changed
+    // /// @param accept New acceptance status
+    // function toggleAcceptToken(ISuperToken token, bool accept)
+    //     public
+    //     onlyOwner
+    // {
+    //     _acceptedTokens[token] = accept;
+    // }
 
-    /**
-     * @dev anyone can call this method at any time. Will revert if niflot is not mature. See _beforeTokenTransfer for the handover process.
-     */
+    /// @notice Burns a mature NIFLOT, restoring the original stream from origin to receiver
+    /// @dev Anyone can call this method at any time
+    /// @dev  Will revert if niflot is not mature
+    /// @dev See `_beforeTokenTransfer` for the handover process.
+    /// @param tokenId The token ID of the NIFLOT that is being burned 
     function burn(uint256 tokenId) external {
         require(
             niflots[tokenId].started == 0 || isMature(tokenId),
@@ -103,9 +122,9 @@ contract Niflot is ERC721, Ownable {
         );
     }
 
-    /**
-     * @notice aka the "fire an employee" use case.
-     */
+    /// @notice Lets an origin cancel a stream and burns associated NIFLOT
+    /// @notice Employer may circumvent by manually canceling stream on their end
+    /// @param tokenId The NIFLOT token ID pertaining to the stream that is being cancelled
     function cancelByOrigin(uint256 tokenId) external exists(tokenId) {
         NiflotMetadata memory meta = niflots[tokenId];
 
@@ -119,27 +138,28 @@ contract Niflot is ERC721, Ownable {
         );
     }
 
-    /**
-     * todo: potentially add a dedicated flowrate so don't have to sell everything at once.
-     * @param token the currency this Niflot is based on
-     * @param origin the source that streams `token` to your account
-     * @param durationInSeconds how long this Niflot will run after it's been transferred for the first time
-     */
+    // TODO: potentially add a dedicated flowrate so don't have to sell everything at once.
+    /// @notice Mint a NIFLOT against a stream you're receiving
+    /// @param token the currency this Niflot is based on
+    /// @param origin the source that streams `token` to your account
+    /// @param durationInSeconds how long this Niflot will run after it's been transferred for the first time
     function mint(
         ISuperToken token,
         address origin,
         uint256 durationInSeconds
     ) external {
-        //todo check if token is in _acceptedTokens
+        // Accepted token toggle?
 
         require(
             MAX_DURATION_SECONDS >= durationInSeconds,
             "niflot duration exceeds one month"
         );
 
-        (, int96 flowrate, , ) = _cfa.getFlow(token, origin, msg.sender);
+        // Get flow from origin to receiver
+        (, int96 flowrate, , ) = cfaV1.cfa.getFlow(token, origin, msg.sender);
         require(flowrate > 0, "origin isn't streaming to you");
 
+        // Get investments
         int96 alreadyInvested = _investments[origin][msg.sender];
         require(
             alreadyInvested < flowrate,
@@ -167,7 +187,7 @@ contract Niflot is ERC721, Ownable {
     ) internal override {
         //blocks transfers to superApps - done for simplicity, but you could support super apps in a new version!
         require(
-            !_host.isApp(ISuperApp(newReceiver)) ||
+            !cfaV1.host.isApp(ISuperApp(newReceiver)) ||
                 newReceiver == address(this),
             "New receiver cannot be a superApp"
         );
@@ -189,14 +209,14 @@ contract Niflot is ERC721, Ownable {
 
             //burnt
             cfaV1._decreaseFlowByOperator(
-                _cfa,
+                cfaV1.cfa,
                 meta.token,
                 meta.origin,
                 oldReceiver,
                 meta.flowrate
             );
             cfaV1._increaseFlowByOperator(
-                _cfa,
+                cfaV1.cfa,
                 meta.token,
                 meta.origin,
                 meta.receiver,
@@ -223,14 +243,14 @@ contract Niflot is ERC721, Ownable {
 
             //handover flow
             cfaV1._decreaseFlowByOperator(
-                _cfa,
+                cfaV1.cfa,
                 meta.token,
                 meta.origin,
                 oldReceiver,
                 meta.flowrate
             );
             cfaV1._increaseFlowByOperator(
-                _cfa,
+                cfaV1.cfa,
                 meta.token,
                 meta.origin,
                 newReceiver,
@@ -323,7 +343,7 @@ contract Niflot is ERC721, Ownable {
     //         uint256 until
     //     )
     // {
-    //     (, nftFlowrate, , ) = _cfa.getFlow(
+    //     (, nftFlowrate, , ) = cfaV1.cfa.getFlow(
     //         _acceptedToken,
     //         address(this),
     //         ownerOf(tokenId)
